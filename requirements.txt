@@ -1,0 +1,12 @@
+numpy==1.23.5
+scipy==1.10.0
+tqdm==4.67.1
+PyYAML==5.3.1
+matplotlib==3.7.5
+pandas==2.0.3
+opencv-python==4.10.0.84
+imageio==2.22.4
+imageio-ffmpeg==0.5.1
+Pillow==9.3.0
+openai==2.2.0
+anthropic==0.72.0
