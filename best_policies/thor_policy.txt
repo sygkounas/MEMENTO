@@ -1,0 +1,916 @@
+import math
+import random
+from collections import deque
+
+
+class Policy:
+    def __init__(self, seed=0, debug=False):
+        self.rng = random.Random(seed)
+        self.debug = debug
+        self.reset()
+
+    def reset(self):
+        self.ids = {
+            "Apple": None,
+            "Bread": None,
+            "Microwave": None,
+            "Fridge": None,
+        }
+
+        self.pos = {
+            "Apple": None,
+            "Bread": None,
+            "Microwave": None,
+            "Fridge": None,
+        }
+
+        self.step_idx = 0
+        self.last_key = None
+
+        self.turn_bias = 1
+        self.explore_step = 0
+
+        self.pending_move_edge = None
+        self.blocked_edges = set()
+        self.blocked_move_streak = 0
+
+        self.apple_search_steps = 0
+        self.bread_search_steps = 0
+
+        self.hidden_apple_probe_used = False
+        self.hidden_scan_queue = deque()
+
+        self.apple_from_fridge = False
+        self.close_fridge_after_apple = False
+
+        self.put_repair_container = None
+        self.put_repair_queue = deque()
+        self.put_fail_count = {
+            "Microwave": 0,
+            "Fridge": 0,
+        }
+
+        self.bad_put_cells = {
+            "Microwave": set(),
+            "Fridge": set(),
+        }
+
+        self.failed_pickups = set()
+
+    def _space(self, obs, action):
+        xs = (obs.get("action_space", {}) or {}).get(action, [])
+        return xs if isinstance(xs, list) else []
+
+    def _can(self, obs, action):
+        acts = obs.get("available_actions")
+        if isinstance(acts, list):
+            return action in acts
+        return True
+
+    def _typ(self, oid):
+        if not isinstance(oid, str):
+            return None
+        return oid.split("|", 1)[0]
+
+    def _parse_pos(self, oid):
+        if not isinstance(oid, str):
+            return None
+
+        parts = oid.split("|")
+        if len(parts) < 4:
+            return None
+
+        try:
+            return float(parts[1]), float(parts[2]), float(parts[3])
+        except Exception:
+            return None
+
+    def _agent_pos(self, obs):
+        agent = obs.get("agent", {}) or {}
+        pos = agent.get("position", {}) or {}
+
+        try:
+            return (
+                float(pos.get("x", agent.get("x", 0.0))),
+                float(pos.get("y", agent.get("y", 0.0))),
+                float(pos.get("z", agent.get("z", 0.0))),
+            )
+        except Exception:
+            return None
+
+    def _yaw(self, obs):
+        agent = obs.get("agent", {}) or {}
+        rot = agent.get("rotation", {}) or {}
+
+        try:
+            return float(rot.get("y", agent.get("rotation_y", agent.get("yaw", 0.0)))) % 360.0
+        except Exception:
+            return 0.0
+
+    def _horizon(self, obs):
+        agent = obs.get("agent", {}) or {}
+        try:
+            return float(agent.get("cameraHorizon", 0.0))
+        except Exception:
+            return 0.0
+
+    def _angle_diff(self, target, current):
+        return (target - current + 180.0) % 360.0 - 180.0
+
+    def _cell(self, obs):
+        p = self._agent_pos(obs)
+        if p is None:
+            return None
+        return int(round(p[0] / 0.25)), int(round(p[2] / 0.25))
+
+    def _dir(self, obs):
+        return int(round(self._yaw(obs) / 90.0)) % 4
+
+    def _pose_key(self, obs):
+        c = self._cell(obs)
+        if c is None:
+            return None
+        return c[0], c[1], self._dir(obs)
+
+    def _progress(self, obs):
+        return obs.get("task_progress", {}) or {}
+
+    def _last(self, obs):
+        return obs.get("last_action_result", {}) or {}
+
+    def _holding(self, obs):
+        inv = obs.get("inventory", {}) or {}
+
+        h = inv.get("holding")
+        if isinstance(h, str):
+            if "|" in h:
+                return self._typ(h)
+            return h
+
+        hid = inv.get("holding_object_id")
+        if isinstance(hid, str):
+            return self._typ(hid)
+
+        objs = inv.get("inventoryObjects")
+        if isinstance(objs, list) and objs:
+            oid = objs[0].get("objectId") if isinstance(objs[0], dict) else None
+            if isinstance(oid, str):
+                return self._typ(oid)
+
+        return None
+
+    def _remember_id(self, typ, oid):
+        if typ not in self.ids or not oid:
+            return
+
+        self.ids[typ] = oid
+
+        p = self._parse_pos(oid)
+        if p is not None:
+            self.pos[typ] = p
+
+    def _update_memory(self, obs):
+        targets = obs.get("targets", {}) or {}
+
+        mapping = {
+            "Apple": "apple_object_id",
+            "Bread": "bread_object_id",
+            "Microwave": "microwave_object_id",
+            "Fridge": "fridge_object_id",
+        }
+
+        for typ, key in mapping.items():
+            oid = targets.get(key)
+            if oid:
+                self._remember_id(typ, oid)
+
+        for obj in obs.get("visible_objects", []) or []:
+            if not isinstance(obj, dict):
+                continue
+
+            oid = obj.get("objectId")
+            typ = obj.get("objectType")
+
+            if typ in self.ids and oid:
+                self._remember_id(typ, oid)
+
+        for action in (
+            "pickup_object",
+            "open_object",
+            "close_object",
+            "put_object",
+            "toggle_on",
+        ):
+            for oid in self._space(obs, action):
+                typ = self._typ(oid)
+                if typ in self.ids:
+                    self._remember_id(typ, oid)
+
+    def _select(self, obs, action, typ):
+        space = self._space(obs, action)
+        known = self.ids.get(typ)
+
+        if known in space:
+            return known
+
+        best = None
+        best_dist = 9999.0
+        agent = self._agent_pos(obs)
+
+        for oid in space:
+            if self._typ(oid) != typ:
+                continue
+
+            d = 9999.0
+            p = self._parse_pos(oid)
+
+            if agent is not None and p is not None:
+                d = math.hypot(p[0] - agent[0], p[2] - agent[2])
+
+            if d < best_dist:
+                best = oid
+                best_dist = d
+
+        return best
+
+    def _visible(self, obs, typ):
+        for action in ("pickup_object", "open_object", "close_object", "put_object", "toggle_on"):
+            if self._select(obs, action, typ):
+                return True
+
+        for obj in obs.get("visible_objects", []) or []:
+            if isinstance(obj, dict) and obj.get("objectType") == typ and obj.get("visible", True):
+                return True
+
+        return False
+
+    def _distance(self, obs, typ):
+        agent = self._agent_pos(obs)
+        if agent is None:
+            return None
+
+        for obj in obs.get("visible_objects", []) or []:
+            if not isinstance(obj, dict):
+                continue
+            if obj.get("objectType") != typ:
+                continue
+            try:
+                return float(obj.get("distance"))
+            except Exception:
+                pass
+
+        p = self.pos.get(typ)
+        if p is None:
+            return None
+
+        return math.hypot(p[0] - agent[0], p[2] - agent[2])
+
+    def _dir_delta(self, d):
+        d = d % 4
+
+        if d == 0:
+            return 0, 1
+        if d == 1:
+            return 1, 0
+        if d == 2:
+            return 0, -1
+        return -1, 0
+
+    def _next_cell(self, gx, gz, d):
+        dx, dz = self._dir_delta(d)
+        return gx + dx, gz + dz
+
+    def _cell_center(self, cell):
+        return cell[0] * 0.25, cell[1] * 0.25
+
+    def _cell_dist_to_obj(self, cell, typ):
+        p = self.pos.get(typ)
+        if p is None:
+            return 9999.0
+
+        x, z = self._cell_center(cell)
+        return math.hypot(p[0] - x, p[2] - z)
+
+    def _edge_blocked(self, gx, gz, d):
+        return (gx, gz, d % 4) in self.blocked_edges
+
+    def _move_ahead(self, obs):
+        self.pending_move_edge = self._pose_key(obs)
+        return "move_ahead", None
+
+    def _turn_left(self):
+        return "rotate_left", None
+
+    def _turn_right(self):
+        return "rotate_right", None
+
+    def _turn_to_dir(self, obs, target_dir):
+        cur = self._dir(obs)
+        target_dir %= 4
+
+        if cur == target_dir:
+            return None
+
+        diff = (target_dir - cur) % 4
+
+        if diff == 1:
+            return self._turn_right()
+        if diff == 3:
+            return self._turn_left()
+
+        return self._turn_right() if self.turn_bias > 0 else self._turn_left()
+
+    def _front_metrics(self, obs, typ):
+        p = self.pos.get(typ)
+        agent = self._agent_pos(obs)
+
+        if p is None or agent is None:
+            return None
+
+        ax, _, az = agent
+        tx, _, tz = p
+
+        dx = tx - ax
+        dz = tz - az
+
+        d = self._dir(obs)
+        fdx, fdz = self._dir_delta(d)
+
+        forward = dx * fdx + dz * fdz
+        lateral = dx * fdz - dz * fdx
+        dist = math.hypot(dx, dz)
+
+        return forward, lateral, dist
+
+    def _turn_towards_object(self, obs, typ):
+        p = self.pos.get(typ)
+        agent = self._agent_pos(obs)
+
+        if p is None or agent is None:
+            return None
+
+        dx = p[0] - agent[0]
+        dz = p[2] - agent[2]
+
+        target_yaw = math.degrees(math.atan2(dx, dz)) % 360.0
+        diff = self._angle_diff(target_yaw, self._yaw(obs))
+
+        if abs(diff) <= 35.0:
+            return None
+
+        if diff > 0:
+            return self._turn_right()
+        return self._turn_left()
+
+    def _axis_go_to(self, obs, typ, stop=1.15, avoid_cells=None):
+        p = self.pos.get(typ)
+        agent = self._agent_pos(obs)
+        c = self._cell(obs)
+
+        if p is None or agent is None or c is None:
+            return self._explore(obs)
+
+        dist = math.hypot(p[0] - agent[0], p[2] - agent[2])
+        if dist <= stop and c not in (avoid_cells or set()):
+            return self._pose_repair(obs)
+
+        gx, gz = c
+        cur_dir = self._dir(obs)
+        cur_dist = self._cell_dist_to_obj((gx, gz), typ)
+
+        candidates = []
+
+        for d in range(4):
+            if self._edge_blocked(gx, gz, d):
+                continue
+
+            nc = self._next_cell(gx, gz, d)
+            nd = self._cell_dist_to_obj(nc, typ)
+            improvement = cur_dist - nd
+            bad = nc in (avoid_cells or set())
+
+            score = 10.0 * improvement - 0.05 * nd
+            if bad:
+                score -= 100.0
+            if d == cur_dir:
+                score += 0.2
+
+            candidates.append((score, improvement, -nd, d, nc))
+
+        if not candidates:
+            self.turn_bias *= -1
+            return self._turn_right() if self.turn_bias > 0 else self._turn_left()
+
+        candidates.sort(reverse=True)
+        _, best_improvement, _, best_dir, _ = candidates[0]
+
+        if best_improvement < -0.20:
+            for item in candidates:
+                if item[3] != cur_dir:
+                    best_dir = item[3]
+                    break
+
+        turn = self._turn_to_dir(obs, best_dir)
+        if turn is not None:
+            return turn
+
+        return self._move_ahead(obs)
+
+    def _go_to(self, obs, typ, stop=1.15):
+        return self._axis_go_to(obs, typ, stop=stop)
+
+    def _leave_bad_put_cell(self, obs, container):
+        c = self._cell(obs)
+        if c is None:
+            return self._pose_repair(obs)
+
+        avoid = self.bad_put_cells.get(container, set())
+        gx, gz = c
+        cur_dir = self._dir(obs)
+
+        candidates = []
+        ideal = 1.15 if container == "Microwave" else 1.55
+
+        for d in range(4):
+            if self._edge_blocked(gx, gz, d):
+                continue
+
+            nc = self._next_cell(gx, gz, d)
+            if nc in avoid:
+                continue
+
+            nd = self._cell_dist_to_obj(nc, container)
+            score = -abs(nd - ideal)
+
+            if d == cur_dir:
+                score += 0.15
+
+            candidates.append((score, d, nc))
+
+        if not candidates:
+            self.turn_bias *= -1
+            return self._turn_right() if self.turn_bias > 0 else self._turn_left()
+
+        candidates.sort(reverse=True)
+        _, best_dir, _ = candidates[0]
+
+        turn = self._turn_to_dir(obs, best_dir)
+        if turn is not None:
+            return turn
+
+        return self._move_ahead(obs)
+
+    def _explore(self, obs):
+        h = self._horizon(obs)
+
+        self.explore_step += 1
+        phase = self.explore_step % 18
+
+        if phase in (0, 1, 2, 3):
+            if h > 5.0 and self._can(obs, "look_up"):
+                return "look_up", None
+            if h < -5.0 and self._can(obs, "look_down"):
+                return "look_down", None
+            return self._turn_right() if self.turn_bias > 0 else self._turn_left()
+
+        if phase in (4, 5, 6, 7, 8):
+            if self._can(obs, "move_ahead"):
+                return self._move_ahead(obs)
+
+        if phase in (9, 10, 11, 12):
+            return self._turn_right() if self.turn_bias > 0 else self._turn_left()
+
+        if phase == 13 and self._can(obs, "look_down"):
+            return "look_down", None
+
+        if phase == 14 and self._can(obs, "look_up"):
+            return "look_up", None
+
+        if self._can(obs, "move_ahead"):
+            return self._move_ahead(obs)
+
+        return self._turn_right() if self.turn_bias > 0 else self._turn_left()
+
+    def _record(self, obs):
+        last = self._last(obs)
+
+        key = (
+            obs.get("step_count"),
+            last.get("action"),
+            last.get("object_id"),
+            last.get("success"),
+            last.get("error_message"),
+        )
+
+        if key == self.last_key:
+            return
+
+        self.last_key = key
+
+        action = last.get("action")
+        oid = last.get("object_id")
+        success = last.get("success")
+        typ = self._typ(oid)
+
+        if action == "move_ahead":
+            if success is False:
+                if self.pending_move_edge is not None:
+                    self.blocked_edges.add(self.pending_move_edge)
+                self.blocked_move_streak += 1
+                self.turn_bias *= -1
+            elif success is True:
+                self.blocked_move_streak = 0
+
+            self.pending_move_edge = None
+
+        if action == "put_object" and success is False:
+            if typ in ("Microwave", "Fridge"):
+                c = self._cell(obs)
+                if c is not None:
+                    self.bad_put_cells[typ].add(c)
+
+                self.put_fail_count[typ] += 1
+                self.put_repair_container = typ
+
+                if typ == "Microwave":
+                    if self.put_fail_count[typ] == 1:
+                        self.put_repair_queue = deque(["move_ahead", "look_down"])
+                    elif self.put_fail_count[typ] == 2:
+                        self.put_repair_queue = deque(["rotate_left", "move_ahead", "look_down"])
+                    elif self.put_fail_count[typ] == 3:
+                        self.put_repair_queue = deque(["rotate_right", "move_ahead", "look_down"])
+                    else:
+                        self.put_repair_queue = deque(["leave_bad_cell", "look_down"])
+                else:
+                    if self.put_fail_count[typ] == 1:
+                        self.put_repair_queue = deque(["rotate_left", "move_ahead"])
+                    elif self.put_fail_count[typ] == 2:
+                        self.put_repair_queue = deque(["rotate_right", "move_ahead"])
+                    else:
+                        self.put_repair_queue = deque(["leave_bad_cell", "look_down"])
+
+        if action == "put_object" and success is True:
+            if typ in ("Microwave", "Fridge"):
+                self.put_fail_count[typ] = 0
+                self.put_repair_container = None
+                self.put_repair_queue.clear()
+
+        if action == "pickup_object" and success is False and oid:
+            self.failed_pickups.add((oid, self._pose_key(obs)))
+
+        if action == "pickup_object" and success is True and typ == "Apple":
+            p = self._progress(obs)
+            if p.get("fridge_open", False):
+                self.apple_from_fridge = True
+                self.close_fridge_after_apple = True
+
+    def _pose_repair(self, obs):
+        h = self._horizon(obs)
+
+        phase = (self.step_idx + self.blocked_move_streak) % 6
+
+        if phase == 0 and h < 35.0 and self._can(obs, "look_down"):
+            return "look_down", None
+
+        if phase == 1 and self._can(obs, "move_ahead"):
+            return self._move_ahead(obs)
+
+        if phase == 2:
+            return self._turn_right() if self.turn_bias > 0 else self._turn_left()
+
+        if phase == 3 and h > 5.0 and self._can(obs, "look_up"):
+            return "look_up", None
+
+        if phase == 4:
+            return self._turn_left() if self.turn_bias > 0 else self._turn_right()
+
+        if self._can(obs, "move_ahead"):
+            return self._move_ahead(obs)
+
+        return self._turn_right() if self.turn_bias > 0 else self._turn_left()
+
+    def _run_put_repair(self, obs):
+        if not self.put_repair_container:
+            return None
+
+        p = self._progress(obs)
+        container = self.put_repair_container
+
+        open_flag = "microwave_open" if container == "Microwave" else "fridge_open"
+        if not p.get(open_flag, False):
+            self.put_repair_container = None
+            self.put_repair_queue.clear()
+            return None
+
+        while self.put_repair_queue:
+            action = self.put_repair_queue.popleft()
+
+            if action == "leave_bad_cell":
+                return self._leave_bad_put_cell(obs, container)
+
+            if action == "look_down":
+                if self._horizon(obs) < 35.0 and self._can(obs, "look_down"):
+                    return "look_down", None
+                continue
+
+            if action == "look_up":
+                if self._horizon(obs) > 5.0 and self._can(obs, "look_up"):
+                    return "look_up", None
+                continue
+
+            if action == "move_ahead":
+                if self._can(obs, "move_ahead"):
+                    return self._move_ahead(obs)
+                continue
+
+            if action == "rotate_left":
+                if self._can(obs, "rotate_left"):
+                    return "rotate_left", None
+                continue
+
+            if action == "rotate_right":
+                if self._can(obs, "rotate_right"):
+                    return "rotate_right", None
+                continue
+
+        c = self._cell(obs)
+        if c is not None and c in self.bad_put_cells.get(container, set()):
+            return self._leave_bad_put_cell(obs, container)
+
+        oid = self._select(obs, "put_object", container)
+        if oid:
+            return "put_object", oid
+
+        return self._go_to(obs, container, stop=1.05)
+
+    def _pickup(self, obs, typ):
+        oid = self._select(obs, "pickup_object", typ)
+
+        if oid:
+            if (oid, self._pose_key(obs)) not in self.failed_pickups:
+                return "pickup_object", oid
+            return self._pose_repair(obs)
+
+        if self._visible(obs, typ):
+            if self._horizon(obs) < 30.0 and self._can(obs, "look_down"):
+                return "look_down", None
+
+        return self._go_to(obs, typ, stop=0.75)
+
+    def _put_into(self, obs, container):
+        repair = self._run_put_repair(obs)
+        if repair is not None:
+            return repair
+
+        c = self._cell(obs)
+        if c is not None and c in self.bad_put_cells.get(container, set()):
+            return self._leave_bad_put_cell(obs, container)
+
+        oid = self._select(obs, "put_object", container)
+        if oid:
+            return "put_object", oid
+
+        p = self._progress(obs)
+
+        if container == "Microwave":
+            if not p.get("microwave_open", False):
+                open_id = self._select(obs, "open_object", "Microwave")
+                if open_id:
+                    return "open_object", open_id
+                return self._go_to(obs, "Microwave", stop=1.2)
+
+            metrics = self._front_metrics(obs, "Microwave")
+            if metrics is not None:
+                forward, lateral, dist = metrics
+
+                if abs(lateral) > 0.45:
+                    turn = self._turn_towards_object(obs, "Microwave")
+                    if turn is not None:
+                        return turn
+
+                if dist > 1.35:
+                    return self._axis_go_to(obs, "Microwave", stop=1.15)
+
+            return self._axis_go_to(
+                obs,
+                "Microwave",
+                stop=1.05,
+                avoid_cells=self.bad_put_cells.get("Microwave", set()),
+            )
+
+        if container == "Fridge":
+            if not p.get("fridge_open", False):
+                open_id = self._select(obs, "open_object", "Fridge")
+                if open_id:
+                    return "open_object", open_id
+                return self._go_to(obs, "Fridge", stop=1.9)
+
+            return self._axis_go_to(
+                obs,
+                "Fridge",
+                stop=1.75,
+                avoid_cells=self.bad_put_cells.get("Fridge", set()),
+            )
+
+        return self._pose_repair(obs)
+
+    def _apple_to_microwave(self, obs):
+        p = self._progress(obs)
+
+        if self.close_fridge_after_apple and p.get("fridge_open", False):
+            close_id = self._select(obs, "close_object", "Fridge")
+            if close_id:
+                return "close_object", close_id
+            return self._pose_repair(obs)
+
+        if not p.get("fridge_open", False):
+            self.close_fridge_after_apple = False
+
+        if not p.get("microwave_open", False):
+            open_id = self._select(obs, "open_object", "Microwave")
+            if open_id:
+                return "open_object", open_id
+            return self._go_to(obs, "Microwave", stop=1.2)
+
+        return self._put_into(obs, "Microwave")
+
+    def _bread_to_fridge(self, obs):
+        p = self._progress(obs)
+
+        if not p.get("fridge_open", False):
+            open_id = self._select(obs, "open_object", "Fridge")
+            if open_id:
+                return "open_object", open_id
+
+            return self._go_to(obs, "Fridge", stop=1.9)
+
+        put_id = self._select(obs, "put_object", "Fridge")
+        if put_id:
+            c = self._cell(obs)
+            if c is None or c not in self.bad_put_cells.get("Fridge", set()):
+                return "put_object", put_id
+
+        return self._axis_go_to(
+            obs,
+            "Fridge",
+            stop=1.75,
+            avoid_cells=self.bad_put_cells.get("Fridge", set()),
+        )
+
+    def _finalize_microwave(self, obs):
+        p = self._progress(obs)
+
+        if p.get("microwave_open", False):
+            close_id = self._select(obs, "close_object", "Microwave")
+            if close_id:
+                return "close_object", close_id
+            return self._go_to(obs, "Microwave", stop=1.2)
+
+        if not p.get("microwave_on", False):
+            toggle_id = self._select(obs, "toggle_on", "Microwave")
+            if toggle_id:
+                return "toggle_on", toggle_id
+            return self._go_to(obs, "Microwave", stop=1.2)
+
+        return None
+
+    def _hidden_apple_scan(self, obs):
+        if not self.hidden_scan_queue:
+            return None
+
+        if self._select(obs, "pickup_object", "Apple"):
+            self.hidden_scan_queue.clear()
+            return None
+
+        while self.hidden_scan_queue:
+            action = self.hidden_scan_queue.popleft()
+
+            if action == "look_down":
+                if self._horizon(obs) < 45.0 and self._can(obs, "look_down"):
+                    return "look_down", None
+                continue
+
+            if action == "look_up":
+                if self._horizon(obs) > 5.0 and self._can(obs, "look_up"):
+                    return "look_up", None
+                continue
+
+            if action == "rotate_right":
+                if self._can(obs, "rotate_right"):
+                    return "rotate_right", None
+                continue
+
+            if action == "rotate_left":
+                if self._can(obs, "rotate_left"):
+                    return "rotate_left", None
+                continue
+
+        return None
+
+    def _maybe_probe_fridge_for_apple(self, obs):
+        if self.hidden_apple_probe_used:
+            return None
+
+        if self._visible(obs, "Apple"):
+            return None
+
+        if self._select(obs, "pickup_object", "Apple"):
+            return None
+
+        if self.apple_search_steps < 14:
+            return None
+
+        p = self._progress(obs)
+
+        if p.get("fridge_open", False):
+            self.hidden_apple_probe_used = True
+            self.hidden_scan_queue = deque(
+                [
+                    "look_down",
+                    "look_down",
+                    "rotate_right",
+                    "rotate_right",
+                    "rotate_right",
+                    "rotate_right",
+                    "look_up",
+                ]
+            )
+            return self._hidden_apple_scan(obs)
+
+        open_id = self._select(obs, "open_object", "Fridge")
+        if open_id:
+            self.hidden_apple_probe_used = True
+            self.hidden_scan_queue = deque(
+                [
+                    "look_down",
+                    "look_down",
+                    "rotate_right",
+                    "rotate_right",
+                    "rotate_right",
+                    "rotate_right",
+                    "look_up",
+                ]
+            )
+            return "open_object", open_id
+
+        if self.pos.get("Fridge") is not None:
+            return self._go_to(obs, "Fridge", stop=1.9)
+
+        return None
+
+    def compute_action(self, obs):
+        self.step_idx += 1
+        self._update_memory(obs)
+        self._record(obs)
+
+        p = self._progress(obs)
+
+        if p.get("success", False):
+            return "done", None
+
+        holding = self._holding(obs)
+
+        if holding == "Apple":
+            self.apple_search_steps = 0
+            return self._apple_to_microwave(obs)
+
+        if holding == "Bread":
+            self.bread_search_steps = 0
+            return self._bread_to_fridge(obs)
+
+        if not p.get("apple_in_microwave", False):
+            self.apple_search_steps += 1
+
+            oid = self._select(obs, "pickup_object", "Apple")
+            if oid:
+                return self._pickup(obs, "Apple")
+
+            scan = self._hidden_apple_scan(obs)
+            if scan is not None:
+                return scan
+
+            probe = self._maybe_probe_fridge_for_apple(obs)
+            if probe is not None:
+                return probe
+
+            return self._go_to(obs, "Apple", stop=0.75)
+
+        if not p.get("microwave_on", False):
+            out = self._finalize_microwave(obs)
+            if out is not None:
+                return out
+
+        if not p.get("bread_in_fridge", False):
+            self.bread_search_steps += 1
+
+            oid = self._select(obs, "pickup_object", "Bread")
+            if oid:
+                return self._pickup(obs, "Bread")
+
+            return self._go_to(obs, "Bread", stop=0.75)
+
+        out = self._finalize_microwave(obs)
+        if out is not None:
+            return out
+
+        return "done", None

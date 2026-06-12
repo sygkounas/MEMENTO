@@ -1,0 +1,485 @@
+import numpy as np
+
+
+class FrankaPolicy:
+    """
+    Tower of Hanoi (4 cubes, 3 containers) robust FSM.
+
+    Improvements:
+      - Stable travel height from peg/hole Z (no runaway).
+      - Sim2real noise handling: separate EMA alphas (eef vs cubes/boxes).
+      - Descent gating: forbid DOWN until XY aligned (but still correct XY).
+      - Near-contact caps + slew limiting (reduces knocks / reversals).
+      - PLACE_CENTER micro-centering at contact height before opening.
+      - Big-cube (disk 3) extra-precise placement: tighter gate, longer centering, "stillness" open condition.
+
+    Action: [dx, dy, dz, droll, dpitch, dyaw, gripper] in [-1, 1]
+      gripper: +1 close, -1 open
+    """
+
+    def __init__(self, debug=False):
+        self.debug = bool(debug)
+        self.reset()
+
+    # ------------------------- reset / plan -------------------------
+
+    def reset(self):
+        self.n_cubes = 4
+        self.big_idx = 3
+        self.plan = self._generate_hanoi_plan(self.n_cubes, 0, 1, 2)  # (disk, src, dst)
+        self.i = 0
+
+        # FSM
+        self.state = "PICK_TRAVEL"
+        self._state_steps = 0
+        self._watchdog = 720
+        self.done = False
+
+        # Separate EMA (sim2real)
+        self._f = {}
+        self.alpha_eef = 0.45      # less lag
+        self.alpha_cubes = 0.30    # more smoothing
+        self.alpha_boxes = 0.30
+
+        # Base control (slow-ish)
+        self.kp_xy = 4.6
+        self.kp_z = 3.8
+        self.max_xy = 0.28
+        self.max_z = 0.20
+
+        # Near-contact caps (reduce side hits / rotation)
+        self.max_xy_near = 0.10
+        self.max_z_near = 0.10
+
+        # Slew limiting (prevents jerk on reversals)
+        self._prev_cmd = np.zeros(3, dtype=np.float64)
+        self.slew_xy = 0.06
+        self.slew_z = 0.05
+
+        # Low-zone lateral scaling (still allows XY, just smaller)
+        self.low_zone = 0.10
+        self.low_xy_scale = 0.35
+
+        # Travel / heights
+        self.travel_offset = 0.23
+        self.z_pregrasp = 0.080
+        self.z_lift_extra = 0.18
+        self.place_above_extra = 0.11
+        self.place_margin = 0.004
+
+        # Descent gates
+        self.xy_gate_pick = 0.010
+        self.xy_gate_pick_final = 0.007
+        self.xy_gate_place = 0.010
+        self.xy_gate_place_final = 0.006
+
+        # Big cube extra precision
+        self.big_xy_gate_place_final = 0.004
+
+        # Gripper timing
+        self.hold = 0
+        self.hold_close = 12
+        self.hold_open = 9
+
+        # Retry offsets
+        self.retry_k = 0
+        self.max_retries = 10
+        self.retry_offsets = self._make_retry_offsets(step=0.006, rings=4)
+
+        # Grasp verification
+        self._cube_pos_at_grasp = None
+        self._lift_target_z = None
+
+        # Placement centering
+        self.center_kp_xy = 2.2
+
+        self.center_steps = 14
+        self.center_max_xy = 0.060
+        self.center_open_xy = 0.0025
+
+        self.big_center_steps = 26
+        self.big_center_max_xy = 0.035
+        self.big_center_open_xy = 0.0018
+
+        # "stillness" open condition (sim2real friendly)
+        self.center_open_still = 4
+        self.still_cmd_xy = 0.010
+        self._center_count = 0
+        self._still_count = 0
+
+    def _generate_hanoi_plan(self, n, src, aux, dst):
+        plan = []
+
+        def rec(k, a, b, c):
+            if k == 0:
+                return
+            rec(k - 1, a, c, b)
+            plan.append((k - 1, a, c))
+            rec(k - 1, b, a, c)
+
+        rec(n, src, aux, dst)
+        return plan
+
+    # ------------------------- filtering -------------------------
+
+    def _ema(self, key, value, alpha):
+        v = np.asarray(value, dtype=np.float64)
+        if key not in self._f:
+            self._f[key] = v.copy()
+        else:
+            self._f[key] = (1.0 - alpha) * self._f[key] + alpha * v
+        return self._f[key]
+
+    # ------------------------- geometry -------------------------
+
+    @staticmethod
+    def _quat_to_rotmat(q_wxyz):
+        w, x, y, z = q_wxyz
+        n = np.sqrt(w * w + x * x + y * y + z * z) + 1e-12
+        w, x, y, z = w / n, x / n, y / n, z / n
+        ww, xx, yy, zz = w * w, x * x, y * y, z * z
+        wx, wy, wz = w * x, w * y, w * z
+        xy, xz, yz = x * y, x * z, y * z
+        return np.array(
+            [
+                [ww + xx - yy - zz, 2 * (xy - wz), 2 * (xz + wy)],
+                [2 * (xy + wz), ww - xx + yy - zz, 2 * (yz - wx)],
+                [2 * (xz - wy), 2 * (yz + wx), ww - xx + yy - zz],
+            ],
+            dtype=np.float64,
+        )
+
+    def _hole_center(self, box_pos, box_quat):
+        offset = np.array([0.055, 0.0, 0.0], dtype=np.float64)
+        R = self._quat_to_rotmat(box_quat)
+        return np.asarray(box_pos, dtype=np.float64) + R @ offset
+
+    def _stack_top_surface_z(self, cube_pos, cube_half, hole_xyz, ignore_idx=None):
+        xy_tol = 0.040
+        hole_z = float(hole_xyz[2])
+
+        surfaces = []
+        for j in range(cube_pos.shape[0]):
+            if ignore_idx is not None and int(j) == int(ignore_idx):
+                continue
+            if np.linalg.norm(cube_pos[j][:2] - hole_xyz[:2]) < xy_tol:
+                surfaces.append(float(cube_pos[j][2] + cube_half[j]))
+
+        if not surfaces:
+            return hole_z
+
+        surfaces.sort()
+        if len(surfaces) >= 2:
+            max_half = float(np.max(cube_half))
+            if (surfaces[-1] - surfaces[-2]) > (max_half + 0.12):
+                surfaces = surfaces[:-1]
+        return max(hole_z, surfaces[-1])
+
+    # ------------------------- command helpers -------------------------
+
+    @staticmethod
+    def _clip(a):
+        return np.clip(a, -1.0, 1.0)
+
+    def _slew(self, cmd_xyz):
+        cmd_xyz = np.asarray(cmd_xyz, dtype=np.float64)
+        out = cmd_xyz.copy()
+        dxy = out[:2] - self._prev_cmd[:2]
+        dz = out[2] - self._prev_cmd[2]
+        dxy = np.clip(dxy, -self.slew_xy, self.slew_xy)
+        dz = float(np.clip(dz, -self.slew_z, self.slew_z))
+        out[:2] = self._prev_cmd[:2] + dxy
+        out[2] = self._prev_cmd[2] + dz
+        self._prev_cmd = out.copy()
+        return out
+
+    def _cmd(self, eef, tgt, travel_z, gate_xy, allow_down, near=False):
+        err = tgt - eef
+        dxy = float(np.linalg.norm(err[:2]))
+        dz_err = float(err[2])
+
+        max_xy = self.max_xy_near if near else self.max_xy
+        max_z = self.max_z_near if near else self.max_z
+
+        cmd_xy = self.kp_xy * err[:2]
+        cmd_z = self.kp_z * err[2]
+
+        cmd_xy = np.clip(cmd_xy, -max_xy, max_xy)
+        cmd_z = float(np.clip(cmd_z, -max_z, max_z))
+
+        # low zone lateral scaling (reduce knocks)
+        if eef[2] < (travel_z - self.low_zone):
+            cmd_xy *= self.low_xy_scale
+
+        # descent gating: forbid DOWN until XY aligned (but keep XY corrections)
+        if (not allow_down) or (dxy > gate_xy):
+            cmd_z = max(0.0, cmd_z)
+
+        cmd_xyz = self._slew(np.array([cmd_xy[0], cmd_xy[1], cmd_z], dtype=np.float64))
+
+        a = np.zeros(7, dtype=np.float64)
+        a[:3] = cmd_xyz
+        a[3:6] = 0.0
+        return a, dxy, dz_err
+
+    def _center_cmd(self, eef, xy_target, max_xy):
+        err_xy = xy_target - eef[:2]
+        cmd_xy = self.center_kp_xy * err_xy
+        cmd_xy = np.clip(cmd_xy, -max_xy, max_xy)
+        cmd_xyz = self._slew(np.array([cmd_xy[0], cmd_xy[1], 0.0], dtype=np.float64))
+
+        a = np.zeros(7, dtype=np.float64)
+        a[:3] = cmd_xyz
+        a[3:6] = 0.0
+        return a, float(np.linalg.norm(err_xy)), float(np.linalg.norm(cmd_xyz[:2]))
+
+    # ------------------------- retry offsets -------------------------
+
+    @staticmethod
+    def _make_retry_offsets(step=0.006, rings=4):
+        offs = [(0.0, 0.0)]
+        for r in range(1, rings + 1):
+            s = r * step
+            offs += [
+                (+s, 0.0), (-s, 0.0), (0.0, +s), (0.0, -s),
+                (+s, +s), (+s, -s), (-s, +s), (-s, -s),
+            ]
+        return [np.array([ox, oy, 0.0], dtype=np.float64) for ox, oy in offs]
+
+    # ------------------------- grasp verify -------------------------
+
+    def _grasp_succeeded(self, cube_pos_now, cube_idx, eef_pos_now):
+        if self._cube_pos_at_grasp is None:
+            return False
+        before = self._cube_pos_at_grasp
+        now = cube_pos_now[cube_idx]
+        dz = float(now[2] - before[2])
+        dxy = float(np.linalg.norm(now[:2] - eef_pos_now[:2]))
+        return (dz > 0.014) and (dxy < 0.050)
+
+    # ------------------------- main -------------------------
+
+    def compute_action(self, obs):
+        if self.done:
+            return np.zeros(7, dtype=np.float64)
+
+        self._state_steps += 1
+        if self._state_steps > self._watchdog:
+            self.state = "PICK_TRAVEL"
+            self._state_steps = 0
+            self._prev_cmd[:] = 0.0
+
+        # Filtered observations (separate alphas)
+        eef = self._ema("eef", obs["robot0_eef_pos"], self.alpha_eef)
+
+        boxes_pos = self._ema("boxes_pos", obs["boxes_pos"], self.alpha_boxes)
+        boxes_quat = self._ema("boxes_quat", obs["boxes_quat"], self.alpha_boxes)
+        cube_pos = self._ema("cube_pos", obs["cube_pos"], self.alpha_cubes)
+
+        boxes_pos = np.asarray(boxes_pos, dtype=np.float64).reshape(3, 3)
+        boxes_quat = np.asarray(boxes_quat, dtype=np.float64).reshape(3, 4)
+
+        cube_pos = np.asarray(cube_pos, dtype=np.float64)
+        if cube_pos.ndim == 1:
+            cube_pos = cube_pos.reshape(-1, 3)
+        cube_half = np.asarray(obs["cube_size"], dtype=np.float64).reshape(-1)
+
+        holes = [
+            self._hole_center(boxes_pos[0], boxes_quat[0]),
+            self._hole_center(boxes_pos[1], boxes_quat[1]),
+            self._hole_center(boxes_pos[2], boxes_quat[2]),
+        ]
+
+        if self.i >= len(self.plan):
+            self.done = True
+            return np.zeros(7, dtype=np.float64)
+
+        disk, _, dst = self.plan[self.i]
+        dst_hole = holes[dst]
+
+        # Stable travel height (peg-based)
+        travel_z = float(np.max([h[2] for h in holes]) + self.travel_offset)
+
+        # Pick targets with retry offsets
+        off = self.retry_offsets[min(self.retry_k, len(self.retry_offsets) - 1)]
+        cp = cube_pos[disk].copy()
+        ch = float(cube_half[disk])
+
+        pick_xy = cp[:2] + off[:2]
+        pick_travel = np.array([pick_xy[0], pick_xy[1], travel_z], dtype=np.float64)
+        pick_above = np.array([pick_xy[0], pick_xy[1], cp[2] + self.z_pregrasp], dtype=np.float64)
+        pick_grasp = np.array([pick_xy[0], pick_xy[1], cp[2]], dtype=np.float64)
+
+        # Place targets (stack height from observation)
+        top_surface = self._stack_top_surface_z(cube_pos, cube_half, dst_hole, ignore_idx=disk)
+        place_travel = np.array([dst_hole[0], dst_hole[1], travel_z], dtype=np.float64)
+        place_above = np.array([dst_hole[0], dst_hole[1], max(travel_z, top_surface + self.place_above_extra)], dtype=np.float64)
+        place_down = np.array([dst_hole[0], dst_hole[1], top_surface + ch + self.place_margin], dtype=np.float64)
+
+        # Big cube tighter gate for final descent
+        final_place_gate = self.big_xy_gate_place_final if disk == self.big_idx else self.xy_gate_place_final
+
+        # ---------------- FSM ----------------
+
+        if self.state == "PICK_TRAVEL":
+            a, dxy, dz = self._cmd(eef, pick_travel, travel_z, gate_xy=0.999, allow_down=True, near=False)
+            a[6] = -1.0
+            if (np.linalg.norm(pick_travel[:2] - eef[:2]) < 0.012) and (abs(pick_travel[2] - eef[2]) < 0.020):
+                self.state = "PICK_PREGRASP"
+                self._state_steps = 0
+                self._prev_cmd[:] = 0.0
+
+        elif self.state == "PICK_PREGRASP":
+            a, dxy, dz = self._cmd(eef, pick_above, travel_z, gate_xy=self.xy_gate_pick, allow_down=True, near=True)
+            a[6] = -1.0
+            if (np.linalg.norm(pick_above[:2] - eef[:2]) < 0.012) and (abs(pick_above[2] - eef[2]) < 0.020):
+                self.state = "PICK_DESCEND"
+                self._state_steps = 0
+                self._prev_cmd[:] = 0.0
+
+        elif self.state == "PICK_DESCEND":
+            a, dxy, dz = self._cmd(
+                eef, pick_grasp, travel_z, gate_xy=self.xy_gate_pick_final, allow_down=True, near=True
+            )
+            a[6] = -1.0
+            if (np.linalg.norm(pick_grasp[:2] - eef[:2]) < 0.010) and (abs(pick_grasp[2] - eef[2]) < 0.012):
+                self.state = "CLOSE"
+                self.hold = self.hold_close
+                self._cube_pos_at_grasp = cp.copy()
+                self._state_steps = 0
+                self._prev_cmd[:] = 0.0
+
+        elif self.state == "CLOSE":
+            a = np.zeros(7, dtype=np.float64)
+            a[6] = +1.0
+            self.hold -= 1
+            if self.hold <= 0:
+                self._lift_target_z = float(max(travel_z, eef[2] + self.z_lift_extra))
+                self.state = "LIFT"
+                self._state_steps = 0
+                self._prev_cmd[:] = 0.0
+            return self._clip(a)
+
+        elif self.state == "LIFT":
+            tgt = np.array([eef[0], eef[1], self._lift_target_z], dtype=np.float64)
+            a, dxy, dz = self._cmd(eef, tgt, travel_z, gate_xy=0.999, allow_down=False, near=False)
+            a[6] = +1.0
+            if abs(tgt[2] - eef[2]) < 0.020:
+                self.state = "VERIFY"
+                self._state_steps = 0
+                self._prev_cmd[:] = 0.0
+
+        elif self.state == "VERIFY":
+            ok = self._grasp_succeeded(cube_pos, disk, eef)
+            if ok:
+                self.retry_k = 0
+                self.state = "PLACE_TRAVEL"
+            else:
+                self.retry_k = min(self.retry_k + 1, self.max_retries)
+                self.state = "OPEN_FAIL"
+                self.hold = self.hold_open
+            self._state_steps = 0
+            self._prev_cmd[:] = 0.0
+            return np.zeros(7, dtype=np.float64)
+
+        elif self.state == "OPEN_FAIL":
+            a = np.zeros(7, dtype=np.float64)
+            a[6] = -1.0
+            self.hold -= 1
+            if self.hold <= 0:
+                self.state = "PICK_TRAVEL"
+                self._state_steps = 0
+                self._prev_cmd[:] = 0.0
+            return self._clip(a)
+
+        elif self.state == "PLACE_TRAVEL":
+            a, dxy, dz = self._cmd(eef, place_travel, travel_z, gate_xy=0.999, allow_down=True, near=False)
+            a[6] = +1.0
+            if (np.linalg.norm(place_travel[:2] - eef[:2]) < 0.012) and (abs(place_travel[2] - eef[2]) < 0.020):
+                self.state = "PLACE_PRE"
+                self._state_steps = 0
+                self._prev_cmd[:] = 0.0
+
+        elif self.state == "PLACE_PRE":
+            a, dxy, dz = self._cmd(eef, place_above, travel_z, gate_xy=self.xy_gate_place, allow_down=True, near=True)
+            a[6] = +1.0
+            if (np.linalg.norm(place_above[:2] - eef[:2]) < 0.012) and (abs(place_above[2] - eef[2]) < 0.020):
+                self.state = "PLACE_DESCEND"
+                self._state_steps = 0
+                self._prev_cmd[:] = 0.0
+
+        elif self.state == "PLACE_DESCEND":
+            a, dxy, dz = self._cmd(eef, place_down, travel_z, gate_xy=final_place_gate, allow_down=True, near=True)
+            a[6] = +1.0
+            if (np.linalg.norm(place_down[:2] - eef[:2]) < 0.010) and (abs(place_down[2] - eef[2]) < 0.014):
+                # enter centering
+                self.state = "PLACE_CENTER"
+                self._center_count = 0
+                self._still_count = 0
+                self._state_steps = 0
+                self._prev_cmd[:] = 0.0
+
+        elif self.state == "PLACE_CENTER":
+            # init on entry
+            if self._center_count == 0:
+                if disk == self.big_idx:
+                    self._center_count = self.big_center_steps
+                else:
+                    self._center_count = self.center_steps
+                self._still_count = 0
+
+            max_xy = self.big_center_max_xy if disk == self.big_idx else self.center_max_xy
+            open_xy = self.big_center_open_xy if disk == self.big_idx else self.center_open_xy
+
+            xy_target = np.array([dst_hole[0], dst_hole[1]], dtype=np.float64)
+            a, exy, cmdxy = self._center_cmd(eef, xy_target, max_xy=max_xy)
+            a[6] = +1.0
+
+            if cmdxy < self.still_cmd_xy:
+                self._still_count += 1
+            else:
+                self._still_count = 0
+
+            self._center_count -= 1
+
+            if (exy < open_xy) and (self._still_count >= self.center_open_still):
+                self.state = "OPEN"
+                self.hold = self.hold_open
+                self._state_steps = 0
+                self._prev_cmd[:] = 0.0
+            elif self._center_count <= 0:
+                # timeout fallback
+                self.state = "OPEN"
+                self.hold = self.hold_open
+                self._state_steps = 0
+                self._prev_cmd[:] = 0.0
+
+        elif self.state == "OPEN":
+            a = np.zeros(7, dtype=np.float64)
+            a[6] = -1.0
+            self.hold -= 1
+            if self.hold <= 0:
+                self.state = "RETREAT"
+                self._state_steps = 0
+                self._prev_cmd[:] = 0.0
+            return self._clip(a)
+
+        elif self.state == "RETREAT":
+            tgt = np.array([eef[0], eef[1], travel_z], dtype=np.float64)
+            a, dxy, dz = self._cmd(eef, tgt, travel_z, gate_xy=0.999, allow_down=True, near=False)
+            a[6] = -1.0
+            if abs(tgt[2] - eef[2]) < 0.020:
+                placed_ok = (np.linalg.norm(cube_pos[disk][:2] - dst_hole[:2]) < 0.045) and (
+                    (eef[2] - cube_pos[disk][2]) > 0.070
+                )
+                if placed_ok:
+                    self.i += 1
+                    self.retry_k = 0
+                else:
+                    self.retry_k = min(self.retry_k + 1, self.max_retries)
+
+                self.state = "PICK_TRAVEL"
+                self._state_steps = 0
+                self._prev_cmd[:] = 0.0
+
+        return self._clip(a)
